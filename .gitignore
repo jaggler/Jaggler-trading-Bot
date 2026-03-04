@@ -1,0 +1,13 @@
+# Sensitive Data
+config/settings.yaml
+
+# Python Environment
+trading_env/
+__pycache__/
+*.pyc
+
+# Local Data and Logs
+data/*.pkl
+logs/*.txt
+master_validation_log.csv
+meta_v3_results_*.csv
