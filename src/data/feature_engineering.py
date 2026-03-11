@@ -47,4 +47,11 @@ class FeatureEngineer:
         
         # Interaction feature: RSI * Regime
         df['rsi_regime'] = df['rsi_14'] * df['regime']
+def add_atr(self, df, period=14):
+        high_low = df['high'] - df['low']
+        high_close = np.abs(df['high'] - df['close'].shift())
+        low_close = np.abs(df['low'] - df['close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        df['atr_14'] = true_range.rolling(period).mean()
         return df

@@ -1,161 +1,336 @@
-# -*- coding: utf-8 -*-
-"""
-Forex ML Trading System - V3 MULTI-SYMBOL
-Equipped with Master Ledger and Demo Execution for EURUSD, GBPUSD, and XAUUSD.
-"""
-import sys
-import yaml
-import requests
-import warnings
-from pathlib import Path
-from datetime import datetime, timedelta
+import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
+import sqlite3
+import time
+from datetime import datetime
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score
-import MetaTrader5 as mt5
 
-# Internal Imports
-sys.path.append(str(Path(__file__).parent / "src"))
-from src.data.mt5_connector import MT5Connector
-from src.data.feature_engineering import FeatureEngineer
-from src.risk.position_sizing import calculate_lot_size
-from src.execution.order_manager import OrderManager
+#############################################
+# CONFIG
+#############################################
 
-warnings.filterwarnings('ignore')
+SYMBOLS = ["EURUSD","GBPUSD","XAUUSD"]
+TIMEFRAME = mt5.TIMEFRAME_M5
+BARS = 500
 
-def send_telegram_msg(message):
-    """Send status updates to Telegram with stable timeout handling."""
-    try:
-        with open("config/settings.yaml", "r") as f:
-            config = yaml.safe_load(f)
-        token = config['telegram']['token']
-        chat_id = config['telegram']['chat_id']
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Telegram Alert Failed: {e}")
+LOT = 0.10
+MAX_TRADES_PER_DAY = 5
 
-class PurgedWalkForwardCV:
-    """Lopez de Prado's purged cross-validation logic."""
-    def __init__(self, n_splits=5, purge_gap=10):
-        self.n_splits = n_splits
-        self.purge_gap = purge_gap
-        
-    def split(self, X):
-        n = len(X)
-        fold_size = n // (self.n_splits + 1)
-        for i in range(1, self.n_splits + 1):
-            train_end = i * fold_size
-            test_start = train_end + self.purge_gap
-            test_end = min((i + 1) * fold_size, n)
-            if test_start < test_end:
-                yield (np.arange(0, train_end), np.arange(test_start, test_end))
+#############################################
+# DATABASE
+#############################################
 
-def run_meta_labeling_v3(X, y, cv, symbol):
-    """V3 Selective Strategy Research."""
-    meta_results = []
-    splits = list(cv.split(X))
-    
-    for fold, (train_idx, test_idx) in enumerate(splits):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        
-        primary = RandomForestClassifier(n_estimators=100, max_depth=5, min_samples_leaf=50, 
-                                        class_weight='balanced', random_state=42, n_jobs=-1)
-        primary.fit(X_train, y_train)
-        
-        train_proba = primary.predict_proba(X_train)[:, 1]
-        test_proba = primary.predict_proba(X_test)[:, 1]
-        
-        meta_y_train = ((train_proba > 0.5).astype(int) == y_train).astype(int)
-        meta_X_train = pd.DataFrame({'primary_conf': train_proba, 'volatility': X_train['volatility_20'].values})
-        meta_X_test = pd.DataFrame({'primary_conf': test_proba, 'volatility': X_test['volatility_20'].values})
-        
-        meta_model = RandomForestClassifier(n_estimators=50, max_depth=3, min_samples_leaf=100, 
-                                            class_weight='balanced', random_state=42)
-        meta_model.fit(meta_X_train, meta_y_train)
-        meta_proba = meta_model.predict_proba(meta_X_test)[:, 1]
-        
-        mask = (test_proba > 0.5) & (meta_proba > 0.65)
-        prec = precision_score(y_test[mask], (test_proba[mask] > 0.5).astype(int), zero_division=0) if mask.sum() > 0 else 0
-        
-        meta_results.append({'fold': fold + 1, 'meta_precision': prec, 'trades_taken': mask.sum()})
-        
-    return pd.DataFrame(meta_results)
+conn = sqlite3.connect("trades.db")
+cursor = conn.cursor()
 
-def run_research_pipeline(symbol):
-    print(f"\n{'='*60}\nSCANNING ASSET: {symbol}\n{'='*60}")
-    
-    connector = MT5Connector()
-    engineer = FeatureEngineer()
-    executor = OrderManager()
-    
-    df = connector.fetch_data(symbol, mt5.TIMEFRAME_H1, datetime.now()-timedelta(days=730), datetime.now())
-    if df is None: return
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trades(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+symbol TEXT,
+direction TEXT,
+price REAL,
+sl REAL,
+tp REAL,
+lot REAL,
+confidence REAL,
+volatility REAL,
+time TEXT
+)
+""")
 
-    features = engineer.create_features(df)
-    engineer.fit_regime_model(features.iloc[:len(features)//2])
-    features = engineer.get_regime_specific_features(features)
-    
-    features['target'] = (features['close'].pct_change(5).shift(-5) > 0).astype(int)
-    features = features.dropna()
-    
-    X_cols = ['ema_50', 'rsi_14', 'bull_fvg', 'bear_fvg', 'volatility_20', 'rsi_regime']
-    X, y = features[X_cols], features['target']
+conn.commit()
 
-    meta_df = run_meta_labeling_v3(X, y, PurgedWalkForwardCV(), symbol)
-    if meta_df.empty: return
+#############################################
+# DAILY TRADE LIMIT
+#############################################
 
-    m_prec = meta_df[meta_df['meta_precision'] > 0]['meta_precision'].mean()
+def trades_today():
 
-    # Train Production
-    p_model = RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_leaf=50, class_weight='balanced', random_state=42)
-    p_model.fit(X, y)
-    
-    p_proba_full = p_model.predict_proba(X)[:, 1]
-    m_y_full = ((p_proba_full > 0.5).astype(int) == y).astype(int)
-    m_X_full = pd.DataFrame({'primary_conf': p_proba_full, 'volatility': X['volatility_20'].values})
-    
-    m_model = RandomForestClassifier(n_estimators=50, max_depth=3, min_samples_leaf=100, class_weight='balanced', random_state=42)
-    m_model.fit(m_X_full, m_y_full)
+    today = datetime.utcnow().date()
 
-    # Signal Logic
+    cursor.execute("SELECT time FROM trades")
+
+    rows = cursor.fetchall()
+
+    count = 0
+
+    for r in rows:
+
+        trade_time = datetime.fromisoformat(r[0]).date()
+
+        if trade_time == today:
+            count += 1
+
+    return count
+
+
+#############################################
+# SESSION FILTER
+#############################################
+
+def session_filter():
+
+    hour = datetime.utcnow().hour
+
+    # London + NY
+    if 7 <= hour <= 11 or 13 <= hour <= 17:
+        return True
+
+    return False
+
+
+#############################################
+# CHECK OPEN POSITION
+#############################################
+
+def position_open(symbol):
+
+    positions = mt5.positions_get(symbol=symbol)
+
+    if positions:
+        return True
+
+    return False
+
+
+#############################################
+# LOG TRADE
+#############################################
+
+def log_trade(symbol,direction,price,sl,tp,lot,confidence,volatility):
+
+    cursor.execute("""
+    INSERT INTO trades
+    (symbol,direction,price,sl,tp,lot,confidence,volatility,time)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    """,(symbol,direction,price,sl,tp,lot,confidence,volatility,str(datetime.utcnow())))
+
+    conn.commit()
+
+
+#############################################
+# FEATURES
+#############################################
+
+def add_features(df):
+
+    df["return"] = df["close"].pct_change()
+
+    df["volatility_20"] = df["return"].rolling(20).std()
+
+    df["ma_fast"] = df["close"].rolling(10).mean()
+    df["ma_slow"] = df["close"].rolling(50).mean()
+
+    df["trend"] = df["ma_fast"] > df["ma_slow"]
+
+    # RSI
+    delta = df["close"].diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss
+
+    df["rsi"] = 100 - (100/(1+rs))
+
+    df = df.dropna()
+
+    return df
+
+
+#############################################
+# ATR
+#############################################
+
+def add_atr(df):
+
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    tr1 = high - low
+    tr2 = abs(high-close.shift())
+    tr3 = abs(low-close.shift())
+
+    tr = pd.concat([tr1,tr2,tr3],axis=1).max(axis=1)
+
+    df["atr_14"] = tr.rolling(14).mean()
+
+    return df
+
+
+#############################################
+# GET DATA
+#############################################
+
+def get_data(symbol):
+
+    rates = mt5.copy_rates_from_pos(symbol,TIMEFRAME,0,BARS)
+
+    df = pd.DataFrame(rates)
+
+    df["time"] = pd.to_datetime(df["time"],unit="s")
+
+    return df
+
+
+#############################################
+# SEND ORDER
+#############################################
+
+def send_order(symbol,order_type,lot,price,sl,tp):
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol":symbol,
+        "volume":lot,
+        "type":order_type,
+        "price":price,
+        "sl":sl,
+        "tp":tp,
+        "deviation":20,
+        "magic":1001,
+        "comment":"ML BOT",
+        "type_time":mt5.ORDER_TIME_GTC,
+        "type_filling":mt5.ORDER_FILLING_IOC
+    }
+
+    result = mt5.order_send(request)
+
+    print("ORDER RESULT:",result)
+
+
+#############################################
+# MAIN PIPELINE
+#############################################
+
+def run_bot(symbol):
+
+    print("====================================")
+    print("SCANNING:",symbol)
+    print("====================================")
+
+    if not session_filter():
+
+        print("Outside trading session")
+        return
+
+    if position_open(symbol):
+
+        print("Position already open")
+        return
+
+    if trades_today() >= MAX_TRADES_PER_DAY:
+
+        print("Daily trade limit reached")
+        return
+
+    df = get_data(symbol)
+
+    df = add_features(df)
+
+    df = add_atr(df)
+
+    if len(df) < 100:
+
+        print("Not enough data")
+        return
+
+    # TARGET
+    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+
+    features = df[["volatility_20","trend","rsi"]]
+
+    X = features
+    y = df["target"]
+
+    model = RandomForestClassifier(n_estimators=150)
+
+    model.fit(X,y)
+
     latest = X.tail(1)
-    p_proba = p_model.predict_proba(latest)[0, 1]
-    m_proba = m_model.predict_proba(pd.DataFrame({'primary_conf': [p_proba], 'volatility': [latest['volatility_20'].values[0]]}))[0, 1]
-    
-    direction = "LONG" if p_proba > 0.5 else "SHORT"
-    should_trade = (p_proba > 0.5) and (m_proba > 0.60)
-    lot = calculate_lot_size(symbol) if should_trade else 0.0
 
-    # EXECUTION Logic (Custom Stops for Gold)
-    if should_trade and lot > 0:
-        price = mt5.symbol_info_tick(symbol).ask if direction == "LONG" else mt5.symbol_info_tick(symbol).bid
-        
-        # SL/TP Adjustments
-        if symbol == "XAUUSD":
-            sl_dist, tp_dist = 500 * mt5.symbol_info(symbol).point, 1000 * mt5.symbol_info(symbol).point
-        else:
-            sl_dist, tp_dist = 200 * mt5.symbol_info(symbol).point, 400 * mt5.symbol_info(symbol).point
-            
-        sl = price - sl_dist if direction == "LONG" else price + sl_dist
-        tp = price + tp_dist if direction == "LONG" else price - tp_dist
-        executor.send_order(symbol, mt5.ORDER_TYPE_BUY if direction=="LONG" else mt5.ORDER_TYPE_SELL, lot, price, sl, tp)
+    proba = model.predict_proba(latest)[0][1]
 
-    # Logging
-    meta_df['run_time'], meta_df['symbol'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S'), symbol
-    meta_df.to_csv("master_validation_log.csv", mode='a', index=False, header=not Path("master_validation_log.csv").exists())
-    
-    msg = f"🤖 *V3 Multi-Scan: {symbol}*\nSignal: {direction}\nMeta Confidence: {m_proba:.1%}\nAction: {'🚀 TRADE FIRED' if should_trade else '❄️ NO TRADE'}\nAvg Precision: {m_prec:.1%}"
-    send_telegram_msg(msg)
-    print(f"--- {symbol} Scan Complete ---")
+    direction = "LONG" if proba > 0.5 else "SHORT"
 
-if __name__ == "__main__":
-    watch_list = ["EURUSD", "GBPUSD", "XAUUSD"]
-    for asset in watch_list:
-        try:
-            run_research_pipeline(asset)
-        except Exception as e:
-            print(f"⚠️ Error scanning {asset}: {e}")
+    # SNIPER FILTER
+    if proba < 0.55:
+
+        print("Weak signal")
+        return
+
+    atr = df["atr_14"].iloc[-1]
+
+    if atr < df["atr_14"].mean():
+
+        print("Low volatility")
+        return
+
+    tick = mt5.symbol_info_tick(symbol)
+
+    if direction == "LONG":
+
+        price = tick.ask
+
+    else:
+
+        price = tick.bid
+
+    sl_dist = atr * 1.5
+    tp_dist = atr * 3
+
+    if direction == "LONG":
+
+        sl = price - sl_dist
+        tp = price + tp_dist
+        order_type = mt5.ORDER_TYPE_BUY
+
+    else:
+
+        sl = price + sl_dist
+        tp = price - tp_dist
+        order_type = mt5.ORDER_TYPE_SELL
+
+    send_order(symbol,order_type,LOT,price,sl,tp)
+
+    log_trade(
+        symbol,
+        direction,
+        price,
+        sl,
+        tp,
+        LOT,
+        proba,
+        latest["volatility_20"].values[0]
+    )
+
+    print("TRADE EXECUTED")
+
+
+#############################################
+# START MT5
+#############################################
+
+if not mt5.initialize():
+
+    print("MT5 INIT FAILED")
+    quit()
+
+#############################################
+# RUN LOOP
+#############################################
+
+while True:
+
+    for symbol in SYMBOLS:
+
+        run_bot(symbol)
+
+    print("Sleeping 300 seconds...\n")
+
+    time.sleep(300)
